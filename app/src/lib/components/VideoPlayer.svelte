@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { browser } from '$app/environment';
+	import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 
 	type Props = {
 		src: string;
@@ -551,95 +552,122 @@
 		trimDisplayMode = 'frames';
 	}
 
+	let isExporting = $state(false);
+	let exportProgress = $state(0);
+
 	async function exportVideo() {
 		if (!browser || !isLoaded || !canvas) {
 			error = 'Cannot export: video not loaded';
 			return;
 		}
 
+		if (isPlaying) pause();
+
+		isExporting = true;
+		exportProgress = 0;
+		error = '';
+
 		try {
-			error = '';
 			const videoEl = (window as any).__videoEl as HTMLVideoElement;
 			if (!videoEl) {
 				error = 'Video element not found';
+				isExporting = false;
 				return;
 			}
 
-			// Get canvas stream for encoding
-			const stream = canvas.captureStream(frameRate) as MediaStream;
-			const recorder = new MediaRecorder(stream, {
-				mimeType: 'video/mp4',
-				videoBitsPerSecond: 5000000 // 5 Mbps
+			const totalVirtFrames = getVirtualTotalFrames();
+			const frameDurationMicros = Math.round(1_000_000 / frameRate);
+
+			// Set up mp4-muxer with fastStart for seekable MP4
+			const target = new ArrayBufferTarget();
+			const muxer = new Muxer({
+				target,
+				video: {
+					codec: 'avc',
+					width: videoWidth,
+					height: videoHeight,
+				},
+				fastStart: 'in-memory',
 			});
 
-			const chunks: Blob[] = [];
-			recorder.ondataavailable = (e: BlobEvent) => {
-				if (e.data.size > 0) {
-					chunks.push(e.data);
-				}
-			};
-
-			recorder.onerror = (e: Event) => {
-				const errorEvent = e as Event & { error?: DOMException };
-				error = `Recording error: ${errorEvent.error?.message || 'Unknown error'}`;
-				console.error('MediaRecorder error:', errorEvent.error);
-			};
-
-			// Wait a bit for the stream to be ready
-			await new Promise(resolve => setTimeout(resolve, 100));
-
-			recorder.start();
-			const wasPlaying = isPlaying;
-			if (wasPlaying) {
-				pause();
-			}
-
-			// Render all kept frames
-			const framesToRender = getVirtualTotalFrames();
-			for (let i = 0; i < framesToRender; i++) {
-				const realFrame = virtualToRealFrame(i);
-				if (realFrame >= 0) {
-					videoEl.currentTime = realFrame / frameRate;
-					await new Promise(resolve => {
-						const onSeeked = () => {
-							drawVideoFrame(videoEl);
-							videoEl.removeEventListener('seeked', onSeeked);
-							// Give the renderer time to draw
-							requestAnimationFrame(() => resolve(null));
-						};
-						videoEl.addEventListener('seeked', onSeeked);
-					});
-				}
-			}
-
-			// Stop recording
-			recorder.stop();
-
-			// Wait for all chunks to be collected
-			await new Promise(resolve => {
-				recorder.onstop = () => resolve(null);
+			// Set up VideoEncoder
+			const encoder = new VideoEncoder({
+				output: (chunk, meta) => {
+					muxer.addVideoChunk(chunk, meta ?? undefined);
+				},
+				error: (e) => {
+					console.error('VideoEncoder error:', e);
+					error = `Encoder error: ${e.message}`;
+				},
 			});
 
-			// Create blob and download
-			const blob = new Blob(chunks, { type: 'video/mp4' });
+			encoder.configure({
+				codec: 'avc1.42001f',
+				width: videoWidth,
+				height: videoHeight,
+				bitrate: 8_000_000,
+				framerate: frameRate,
+			});
+
+			// Encode frame-by-frame with explicit timestamps
+			for (let vf = 0; vf < totalVirtFrames; vf++) {
+				const realFrame = virtualToRealFrame(vf);
+				const targetTime = realFrame / frameRate;
+
+				// Seek to the exact frame
+				videoEl.currentTime = targetTime;
+				await new Promise<void>((resolve) => {
+					const onSeeked = () => {
+						videoEl.removeEventListener('seeked', onSeeked);
+						resolve();
+					};
+					videoEl.addEventListener('seeked', onSeeked);
+					setTimeout(() => {
+						videoEl.removeEventListener('seeked', onSeeked);
+						resolve();
+					}, 300);
+				});
+
+				// Draw frame to canvas
+				drawVideoFrame(videoEl);
+
+				// Create VideoFrame from canvas and encode
+				const frame = new VideoFrame(canvas, {
+					timestamp: vf * frameDurationMicros,
+				});
+				encoder.encode(frame, { keyFrame: vf % 60 === 0 });
+				frame.close();
+
+				exportProgress = Math.round(((vf + 1) / totalVirtFrames) * 100);
+
+				// Yield to UI every 10 frames so progress updates
+				if (vf % 10 === 0) {
+					await new Promise(r => setTimeout(r, 0));
+				}
+			}
+
+			// Flush encoder and finalize muxer
+			await encoder.flush();
+			encoder.close();
+			muxer.finalize();
+
+			// Download the file
+			const blob = new Blob([target.buffer], { type: 'video/mp4' });
 			const url = URL.createObjectURL(blob);
 			const a = document.createElement('a');
 			a.href = url;
-			a.download = `video_${Date.now()}.mp4`;
+			a.download = `video_export_${Date.now()}.mp4`;
 			document.body.appendChild(a);
 			a.click();
 			document.body.removeChild(a);
-			URL.revokeObjectURL(url);
+			setTimeout(() => URL.revokeObjectURL(url), 1000);
 
-			// Restore playback state
-			currentFrame = 0;
-			seek(0);
-			if (wasPlaying) {
-				play();
-			}
 		} catch (e: any) {
 			error = `Export failed: ${e.message}`;
 			console.error('Export error:', e);
+		} finally {
+			isExporting = false;
+			exportProgress = 0;
 		}
 	}
 
@@ -884,11 +912,16 @@
 	<div class="flex justify-end px-2">
 		<button
 			onclick={exportVideo}
-			disabled={!isLoaded}
+			disabled={!isLoaded || isExporting}
 			class="px-4 py-2 bg-blue-600 border border-blue-500 rounded-md text-white text-sm font-medium hover:bg-blue-500 transition-colors disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2"
-			title="Export video with current edits as MP4"
+			title="Export video with current edits"
 		>
-			↓ Export MP4
+			{#if isExporting}
+				<div class="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
+				Exporting {exportProgress}%
+			{:else}
+				↓ Export MP4
+			{/if}
 		</button>
 	</div>
 

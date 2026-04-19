@@ -32,6 +32,8 @@
 	let hoverFrame = $state<number | null>(null);
 	let draggingTrimPoint = $state<'start' | 'end' | null>(null);
 	let trimDisplayMode = $state<'frames' | 'seconds'>('frames');
+	let showTrimConfirmModal = $state(false);
+	let pendingTrimData = $state<{start: number, end: number, duration: string} | null>(null);
 
 	function initDecoder() {
 		decoder = new VideoDecoder({
@@ -262,6 +264,48 @@
 		trimDisplayMode = trimDisplayMode === 'frames' ? 'seconds' : 'frames';
 	}
 
+	function executeTrim() {
+		if (trimStartFrame === null || trimEndFrame === null) return;
+		
+		const start = Math.min(trimStartFrame, trimEndFrame);
+		const end = Math.max(trimStartFrame, trimEndFrame);
+		const durationSeconds = ((end - start + 1) / frameRate).toFixed(2);
+		
+		// Store trim data and show modal
+		pendingTrimData = {
+			start,
+			end,
+			duration: durationSeconds
+		};
+		showTrimConfirmModal = true;
+	}
+
+	function confirmTrim() {
+		if (!pendingTrimData) return;
+		
+		const { start, end, duration } = pendingTrimData;
+		
+		// Log the trim action
+		console.log(`Trim executed: Frame ${start} to ${end}`);
+		console.log(`Duration: ${duration}s`);
+		
+		// TODO: Implement actual trim logic here
+		// This could involve:
+		// - Creating a new video file with only the trimmed segment
+		// - Updating the video source
+		// - Exporting the trimmed video
+		
+		// Close modal and reset
+		showTrimConfirmModal = false;
+		pendingTrimData = null;
+		error = '';
+	}
+
+	function dismissTrimModal() {
+		showTrimConfirmModal = false;
+		pendingTrimData = null;
+	}
+
 	function toggleTrimMode() {
 		isTrimMode = !isTrimMode;
 	}
@@ -422,13 +466,23 @@
 				</div>
 				
 				{#if trimStartFrame !== null && trimEndFrame !== null}
-					<button
-						onclick={toggleTrimDisplayMode}
-						class="px-2 py-1 bg-slate-700 border border-slate-600 rounded text-slate-300 text-xs hover:bg-slate-600 transition-colors"
-						title="Toggle between frames and seconds"
-					>
-						{trimDisplayMode === 'frames' ? '🎬 Frames' : '⏱ Seconds'}
-					</button>
+					<div class="flex items-center gap-2">
+						<button
+							onclick={toggleTrimDisplayMode}
+							class="px-2 py-1 bg-slate-700 border border-slate-600 rounded text-slate-300 text-xs hover:bg-slate-600 transition-colors"
+							title="Toggle between frames and seconds"
+						>
+							{trimDisplayMode === 'frames' ? '🎬 Frames' : '⏱ Seconds'}
+						</button>
+						
+						<button
+							onclick={executeTrim}
+							class="px-3 py-1 bg-green-600 border border-green-500 rounded text-white text-xs font-medium hover:bg-green-500 transition-colors"
+							title="Apply Trim"
+						>
+							✓ Apply Trim
+						</button>
+					</div>
 				{/if}
 			</div>
 		{/if}
@@ -549,3 +603,52 @@
 		</div>
 	</div>
 </div>
+
+<!-- Trim Confirmation Modal -->
+{#if showTrimConfirmModal && pendingTrimData}
+	<div class="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+		<div class="bg-slate-900 border border-slate-700 rounded-lg shadow-2xl max-w-sm mx-4">
+			<!-- Header -->
+			<div class="border-b border-slate-700 px-6 py-4">
+				<h2 class="text-lg font-bold text-white">Confirm Trim</h2>
+			</div>
+			
+			<!-- Content -->
+			<div class="px-6 py-6 space-y-4">
+				<div class="bg-slate-800/50 rounded-lg p-4 space-y-3">
+					<div class="flex justify-between items-center">
+						<span class="text-slate-400 text-sm">Start Frame:</span>
+						<span class="text-white font-mono text-sm">{pendingTrimData.start}</span>
+					</div>
+					<div class="flex justify-between items-center">
+						<span class="text-slate-400 text-sm">End Frame:</span>
+						<span class="text-white font-mono text-sm">{pendingTrimData.end}</span>
+					</div>
+					<div class="border-t border-slate-700 pt-3 flex justify-between items-center">
+						<span class="text-slate-300 text-sm font-medium">Duration:</span>
+						<span class="text-green-400 font-mono text-sm font-bold">{pendingTrimData.duration}s</span>
+					</div>
+				</div>
+				
+				<p class="text-slate-400 text-xs">This action will process the trimmed video segment.</p>
+			</div>
+			
+			<!-- Footer -->
+			<div class="border-t border-slate-700 px-6 py-4 flex items-center gap-3 justify-end">
+				<button
+					onclick={dismissTrimModal}
+					class="px-4 py-2 bg-slate-800 border border-slate-600 rounded-md text-slate-300 text-sm hover:bg-slate-700 transition-colors"
+				>
+					Cancel
+				</button>
+				
+				<button
+					onclick={confirmTrim}
+					class="px-4 py-2 bg-green-600 border border-green-500 rounded-md text-white text-sm font-medium hover:bg-green-500 transition-colors"
+				>
+					Apply Trim
+				</button>
+			</div>
+		</div>
+	</div>
+{/if}

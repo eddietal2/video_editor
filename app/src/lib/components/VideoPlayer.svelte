@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
+	import { browser } from '$app/environment';
 
 	type Props = {
 		src: string;
@@ -21,9 +22,10 @@
 	let frames: EncodedVideoChunk[] = [];
 	let pendingFrame: VideoFrame | null = null;
 	let animationId: number | null = null;
-	let frameRate = 29.97;
+	let frameRate = $state(29.97);
 	let startTime = 0;
 	let decoderConfig: VideoDecoderConfig | null = null;
+	let blobUrl: string | null = null;
 
 	function initDecoder() {
 		decoder = new VideoDecoder({
@@ -59,6 +61,7 @@
 		// For now, use a MediaSource + video element to extract frames via WebCodecs
 		const blob = new Blob([buffer], { type: 'video/mp4' });
 		const url = URL.createObjectURL(blob);
+		blobUrl = url; // Keep the URL alive for the lifetime of the component
 
 		const videoEl = document.createElement('video');
 		videoEl.muted = true;
@@ -86,7 +89,6 @@
 		// Use the video element + canvas for initial frame extraction
 		// This provides a working baseline before implementing raw WebCodecs demuxing
 		await extractFramesViaCanvas(videoEl);
-		URL.revokeObjectURL(url);
 	}
 
 	async function extractFramesViaCanvas(videoEl: HTMLVideoElement) {
@@ -161,9 +163,11 @@
 
 	function pause() {
 		isPlaying = false;
-		const videoEl = (window as any).__videoEl as HTMLVideoElement;
-		if (videoEl) {
-			videoEl.pause();
+		if (browser) {
+			const videoEl = (window as any).__videoEl as HTMLVideoElement;
+			if (videoEl) {
+				videoEl.pause();
+			}
 		}
 		if (animationId !== null) {
 			cancelAnimationFrame(animationId);
@@ -175,11 +179,24 @@
 		const videoEl = (window as any).__videoEl as HTMLVideoElement;
 		if (!videoEl) return;
 
+		const wasPlaying = isPlaying;
+		if (wasPlaying) {
+			videoEl.pause();
+		}
+
 		currentFrame = frameNumber;
 		videoEl.currentTime = frameNumber / frameRate;
-		videoEl.onseeked = () => {
+
+		const onSeeked = () => {
 			drawVideoFrame(videoEl);
+			if (wasPlaying) {
+				videoEl.play().catch((err: any) => {
+					console.error('Failed to resume playback after seek:', err);
+				});
+			}
+			videoEl.removeEventListener('seeked', onSeeked);
 		};
+		videoEl.addEventListener('seeked', onSeeked);
 	}
 
 	function handleSliderInput(e: Event) {
@@ -217,6 +234,8 @@
 	});
 
 	onDestroy(() => {
+		if (!browser) return;
+
 		pause();
 
 		if (pendingFrame) {
@@ -237,6 +256,11 @@
 			}
 			delete (window as any).__videoEl;
 			delete (window as any).__videoContainer;
+		}
+
+		if (blobUrl) {
+			URL.revokeObjectURL(blobUrl);
+			blobUrl = null;
 		}
 	});
 </script>

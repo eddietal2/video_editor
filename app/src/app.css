@@ -1,2 +1,2 @@
-/* Tailwind is injected automatically by the @tailwindcss/postcss plugin */
+@layer base, components, utilities;
 

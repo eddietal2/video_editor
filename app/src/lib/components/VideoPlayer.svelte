@@ -90,38 +90,65 @@
 	}
 
 	async function extractFramesViaCanvas(videoEl: HTMLVideoElement) {
+		// Add video element to document (offscreen, for playback support)
+		videoEl.style.display = 'none';
+		videoEl.crossOrigin = 'anonymous';
+		document.body.appendChild(videoEl);
+
 		isLoaded = true;
 
 		// Draw the first frame
 		videoEl.currentTime = 0;
 		await new Promise<void>((resolve) => {
-			videoEl.onseeked = () => {
-				drawVideoFrame(videoEl);
+			const onSeeked = () => {
+				try {
+					drawVideoFrame(videoEl);
+				} catch (e) {
+					console.error('Failed to draw initial frame:', e);
+				}
+				videoEl.removeEventListener('seeked', onSeeked);
 				resolve();
 			};
+			videoEl.addEventListener('seeked', onSeeked);
 		});
 
 		// Store video element for playback
 		(window as any).__videoEl = videoEl;
+		(window as any).__videoContainer = videoEl;
 	}
 
 	function drawVideoFrame(source: HTMLVideoElement | VideoFrame) {
 		if (!ctx || !canvas) return;
-		ctx.drawImage(source as any, 0, 0, canvas.width, canvas.height);
+		try {
+			ctx.drawImage(source as any, 0, 0, canvas.width, canvas.height);
+		} catch (e) {
+			console.error('Failed to draw frame:', e);
+		}
 	}
 
 	function play() {
 		if (!isLoaded) return;
 		const videoEl = (window as any).__videoEl as HTMLVideoElement;
-		if (!videoEl) return;
+		if (!videoEl) {
+			error = 'Video element not found';
+			return;
+		}
 
 		isPlaying = true;
-		videoEl.play();
+		videoEl.play().catch((err: any) => {
+			error = `Playback error: ${err.message}`;
+			isPlaying = false;
+		});
 
 		const renderLoop = () => {
 			if (!isPlaying) return;
-			drawVideoFrame(videoEl);
-			currentFrame = Math.floor(videoEl.currentTime * frameRate);
+
+			try {
+				drawVideoFrame(videoEl);
+				currentFrame = Math.floor(videoEl.currentTime * frameRate);
+			} catch (e) {
+				console.error('Render error:', e);
+			}
 
 			if (videoEl.ended) {
 				isPlaying = false;
@@ -135,7 +162,9 @@
 	function pause() {
 		isPlaying = false;
 		const videoEl = (window as any).__videoEl as HTMLVideoElement;
-		if (videoEl) videoEl.pause();
+		if (videoEl) {
+			videoEl.pause();
+		}
 		if (animationId !== null) {
 			cancelAnimationFrame(animationId);
 			animationId = null;
@@ -189,18 +218,25 @@
 
 	onDestroy(() => {
 		pause();
+
 		if (pendingFrame) {
 			pendingFrame.close();
 			pendingFrame = null;
 		}
+
 		if (decoder && decoder.state !== 'closed') {
 			decoder.close();
 		}
+
 		const videoEl = (window as any).__videoEl;
 		if (videoEl) {
 			videoEl.pause();
 			videoEl.src = '';
+			if (videoEl.parentNode) {
+				videoEl.parentNode.removeChild(videoEl);
+			}
 			delete (window as any).__videoEl;
+			delete (window as any).__videoContainer;
 		}
 	});
 </script>

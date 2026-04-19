@@ -554,8 +554,9 @@
 
 	let isExporting = $state(false);
 	let exportProgress = $state(0);
+	let exportFps60 = $state(false);
 
-	async function exportVideo() {
+	async function exportVideo(targetFps: number = frameRate) {
 		if (!browser || !isLoaded || !canvas) {
 			error = 'Cannot export: video not loaded';
 			return;
@@ -568,15 +569,18 @@
 		error = '';
 
 		try {
-			const videoEl = (window as any).__videoEl as HTMLVideoElement;
-			if (!videoEl) {
-				error = 'Video element not found';
+			const videoA = (window as any).__videoEl as HTMLVideoElement;
+			const videoB = (window as any).__videoElB as HTMLVideoElement;
+			if (!videoA || !videoB) {
+				error = 'Video elements not found';
 				isExporting = false;
 				return;
 			}
 
 			const totalVirtFrames = getVirtualTotalFrames();
-			const frameDurationMicros = Math.round(1_000_000 / frameRate);
+			const targetFrameDurationMicros = Math.round(1_000_000 / targetFps);
+			const totalDurationSec = totalVirtFrames / frameRate;
+			const outputFrameCount = Math.round(totalDurationSec * targetFps);
 
 			// Set up mp4-muxer with fastStart for seekable MP4
 			const target = new ArrayBufferTarget();
@@ -606,42 +610,140 @@
 				width: videoWidth,
 				height: videoHeight,
 				bitrate: 20_000_000,
-				framerate: frameRate,
+				framerate: targetFps,
 			});
 
-			// Encode frame-by-frame with explicit timestamps
-			for (let vf = 0; vf < totalVirtFrames; vf++) {
-				const realFrame = virtualToRealFrame(vf);
-				const targetTime = realFrame / frameRate;
+			// Direct virtual-time to real-time + segment index mapping
+			function virtualTimeToRealTime(vTimeSec: number): { realTime: number, segIndex: number } {
+				let accumulated = 0;
+				for (let i = 0; i < segments.length; i++) {
+					const seg = segments[i];
+					const segDuration = (seg.endFrame - seg.startFrame + 1) / frameRate;
+					if (vTimeSec < accumulated + segDuration) {
+						const offset = vTimeSec - accumulated;
+						return { realTime: seg.startFrame / frameRate + offset, segIndex: i };
+					}
+					accumulated += segDuration;
+				}
+				const lastSeg = segments[segments.length - 1];
+				return { realTime: lastSeg.endFrame / frameRate, segIndex: segments.length - 1 };
+			}
 
-				// Seek to the exact frame
-				videoEl.currentTime = targetTime;
-				await new Promise<void>((resolve) => {
-					const onSeeked = () => {
-						videoEl.removeEventListener('seeked', onSeeked);
+			// Reliable seek helper (listener attached BEFORE setting currentTime)
+			async function seekAndWait(el: HTMLVideoElement, timeSec: number, timeoutMs: number): Promise<void> {
+				return new Promise<void>((resolve) => {
+					let settled = false;
+					const finish = () => {
+						if (settled) return;
+						settled = true;
+						clearTimeout(timer);
+						el.removeEventListener('seeked', onSeeked);
 						resolve();
 					};
-					videoEl.addEventListener('seeked', onSeeked);
-					setTimeout(() => {
-						videoEl.removeEventListener('seeked', onSeeked);
-						resolve();
-					}, 300);
+					const onSeeked = () => finish();
+					el.addEventListener('seeked', onSeeked);
+					const timer = setTimeout(finish, timeoutMs);
+					el.currentTime = timeSec;
 				});
+			}
+
+			// Boundary-grade seek: waits for seeked + actual frame presentation
+			async function seekAndWaitForFrame(el: HTMLVideoElement, timeSec: number, timeoutMs: number): Promise<void> {
+				return new Promise<void>((resolve) => {
+					let settled = false;
+					const finish = () => {
+						if (settled) return;
+						settled = true;
+						clearTimeout(timer);
+						resolve();
+					};
+					const onSeeked = () => {
+						el.removeEventListener('seeked', onSeeked);
+						// Wait for the frame to actually be composited before resolving
+						if ('requestVideoFrameCallback' in el) {
+							(el as any).requestVideoFrameCallback(() => finish());
+						} else {
+							requestAnimationFrame(() => requestAnimationFrame(() => finish()));
+						}
+					};
+					el.addEventListener('seeked', onSeeked);
+					const timer = setTimeout(finish, timeoutMs);
+					el.currentTime = timeSec;
+				});
+			}
+
+			// Pre-compute segment boundary frames (in output frame space)
+			const segBoundaryOutputFrames: number[] = [];
+			{
+				let accumulated = 0;
+				for (let i = 0; i < segments.length - 1; i++) {
+					const segDuration = (segments[i].endFrame - segments[i].startFrame + 1) / frameRate;
+					accumulated += segDuration;
+					segBoundaryOutputFrames.push(Math.round(accumulated * targetFps));
+				}
+			}
+
+			// Double-buffered export: activeEl handles current segment, standbyEl pre-seeks to next
+			let activeEl = videoA;
+			let standbyEl = videoB;
+			let currentSegIdx = 0;
+			let standbyPromise: Promise<void> | null = null;
+
+			// Seek active element to the start of the first segment
+			await seekAndWaitForFrame(activeEl, segments[0].startFrame / frameRate, 2000);
+
+			// Pre-seek standby to the next segment start (awaited — plenty of time before boundary)
+			if (segments.length > 1) {
+				standbyPromise = seekAndWait(standbyEl, segments[1].startFrame / frameRate, 2000);
+			}
+
+			// Encode at target FPS
+			for (let outFrame = 0; outFrame < outputFrameCount; outFrame++) {
+				const virtualTimeSec = outFrame / targetFps;
+				const { realTime: seekTimeSec, segIndex } = virtualTimeToRealTime(virtualTimeSec);
+
+				// Check if we crossed into a new segment
+				if (segIndex !== currentSegIdx) {
+					// Ensure standby has finished seeking before we swap
+					if (standbyPromise) {
+						await standbyPromise;
+						standbyPromise = null;
+					}
+
+					// Swap: standby (already seeked to segment start) becomes active
+					const temp = activeEl;
+					activeEl = standbyEl;
+					standbyEl = temp;
+					currentSegIdx = segIndex;
+
+					// Boundary-grade seek: waits for the actual frame to be composited,
+					// guaranteeing drawImage gets correct pixels (not a stale buffer)
+					await seekAndWaitForFrame(activeEl, seekTimeSec, 2000);
+
+					// Pre-seek new standby to the NEXT segment if it exists
+					if (currentSegIdx + 1 < segments.length) {
+						standbyPromise = seekAndWait(standbyEl, segments[currentSegIdx + 1].startFrame / frameRate, 2000);
+					}
+				} else {
+					// Normal seek within same segment (fast — nearby position)
+					await seekAndWait(activeEl, seekTimeSec, 300);
+				}
 
 				// Draw frame to canvas
-				drawVideoFrame(videoEl);
+				drawVideoFrame(activeEl);
 
-				// Create VideoFrame from canvas and encode
+				// Encode with explicit timestamp
+				const crossedBoundary = outFrame > 0 && segBoundaryOutputFrames.includes(outFrame);
 				const frame = new VideoFrame(canvas, {
-					timestamp: vf * frameDurationMicros,
+					timestamp: outFrame * targetFrameDurationMicros,
 				});
-				encoder.encode(frame, { keyFrame: vf % 30 === 0 });
+				encoder.encode(frame, { keyFrame: outFrame % Math.round(targetFps) === 0 || crossedBoundary });
 				frame.close();
 
-				exportProgress = Math.round(((vf + 1) / totalVirtFrames) * 100);
+				exportProgress = Math.round(((outFrame + 1) / outputFrameCount) * 100);
 
 				// Yield to UI every 10 frames so progress updates
-				if (vf % 10 === 0) {
+				if (outFrame % 10 === 0) {
 					await new Promise(r => setTimeout(r, 0));
 				}
 			}
@@ -909,9 +1011,9 @@
 	{/if}
 
 	<!-- Export Button (always visible) -->
-	<div class="flex justify-end px-2">
+	<div class="flex justify-end px-2 gap-2">
 		<button
-			onclick={exportVideo}
+			onclick={() => exportVideo(exportFps60 ? 60 : frameRate)}
 			disabled={!isLoaded || isExporting}
 			class="px-4 py-2 bg-blue-600 border border-blue-500 rounded-md text-white text-sm font-medium hover:bg-blue-500 transition-colors disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2"
 			title="Export video with current edits"
@@ -922,6 +1024,14 @@
 			{:else}
 				↓ Export MP4
 			{/if}
+		</button>
+		<button
+			onclick={() => { exportFps60 = !exportFps60; }}
+			disabled={isExporting}
+			class="px-3 py-2 {exportFps60 ? 'bg-amber-600 border-amber-500' : 'bg-slate-700 border-slate-600'} border rounded-md text-white text-sm font-medium hover:opacity-80 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
+			title="Toggle 60 FPS export"
+		>
+			{exportFps60 ? '60 FPS' : '30 FPS'}
 		</button>
 	</div>
 

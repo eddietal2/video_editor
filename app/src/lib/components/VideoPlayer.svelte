@@ -41,6 +41,12 @@
 	let segments = $state<{startFrame: number, endFrame: number}[]>([]);
 	let originalTotalFrames = 0;
 
+	// Filmstrip thumbnails
+	let thumbnails = $state<string[]>([]);
+	let thumbnailCount = 60;
+	let trackContainer: HTMLDivElement;
+	let trackHoverFrame = $state<number | null>(null);
+
 	function initDecoder() {
 		decoder = new VideoDecoder({
 			output: (frame: VideoFrame) => {
@@ -133,6 +139,50 @@
 		// Store video element for playback
 		(window as any).__videoEl = videoEl;
 		(window as any).__videoContainer = videoEl;
+
+		// Generate filmstrip thumbnails
+		await generateThumbnails(videoEl);
+	}
+
+	async function generateThumbnails(videoEl: HTMLVideoElement) {
+		const thumbCanvas = document.createElement('canvas');
+		const thumbW = 160;
+		const thumbH = Math.round(thumbW * (videoHeight / videoWidth));
+		thumbCanvas.width = thumbW;
+		thumbCanvas.height = thumbH;
+		const thumbCtx = thumbCanvas.getContext('2d')!;
+
+		const duration = videoEl.duration;
+		const count = Math.min(thumbnailCount, originalTotalFrames);
+		const interval = duration / count;
+		const thumbs: string[] = [];
+
+		for (let i = 0; i < count; i++) {
+			const time = i * interval;
+			await new Promise<void>((resolve) => {
+				videoEl.currentTime = time;
+				const onSeeked = () => {
+					thumbCtx.drawImage(videoEl, 0, 0, thumbW, thumbH);
+					thumbs.push(thumbCanvas.toDataURL('image/jpeg', 0.5));
+					videoEl.removeEventListener('seeked', onSeeked);
+					resolve();
+				};
+				videoEl.addEventListener('seeked', onSeeked);
+			});
+		}
+
+		thumbnails = thumbs;
+
+		// Reset to frame 0
+		videoEl.currentTime = 0;
+		await new Promise<void>((resolve) => {
+			const onSeeked = () => {
+				drawVideoFrame(videoEl);
+				videoEl.removeEventListener('seeked', onSeeked);
+				resolve();
+			};
+			videoEl.addEventListener('seeked', onSeeked);
+		});
 	}
 
 	function drawVideoFrame(source: HTMLVideoElement | VideoFrame) {
@@ -469,6 +519,74 @@
 		}
 	}
 
+	function handleTrackClick(e: MouseEvent) {
+		if (!trackContainer || !isLoaded) return;
+		const rect = trackContainer.getBoundingClientRect();
+		const percent = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+		const frame = Math.round(percent * (totalFrames - 1));
+
+		if (isTrimMode) {
+			if (trimStartFrame === null) {
+				trimStartFrame = frame;
+			} else if (trimEndFrame === null) {
+				trimEndFrame = frame;
+			}
+		}
+
+		seek(frame);
+	}
+
+	function handleTrackMouseMove(e: MouseEvent) {
+		if (!trackContainer) return;
+		const rect = trackContainer.getBoundingClientRect();
+		const percent = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+		const frame = Math.round(percent * (totalFrames - 1));
+		trackHoverFrame = frame;
+
+		if (isTrimMode) {
+			if (draggingTrimPoint === 'start') {
+				trimStartFrame = frame;
+			} else if (draggingTrimPoint === 'end') {
+				trimEndFrame = frame;
+			} else {
+				hoverFrame = frame;
+			}
+		}
+	}
+
+	function handleTrackMouseLeave() {
+		trackHoverFrame = null;
+		if (!draggingTrimPoint) {
+			hoverFrame = null;
+		}
+	}
+
+	// Get thumbnail index for a given virtual frame position within total frames
+	function getThumbnailsForSegments(): {src: string, widthPercent: number}[] {
+		if (thumbnails.length === 0) return [];
+		const result: {src: string, widthPercent: number}[] = [];
+		const virtualTotal = getVirtualTotalFrames();
+		if (virtualTotal === 0) return [];
+
+		for (const seg of segments) {
+			const segLen = seg.endFrame - seg.startFrame + 1;
+			const widthPercent = (segLen / virtualTotal) * 100;
+			// Pick thumbnails from this segment's real frame range
+			const framesPerThumb = originalTotalFrames / thumbnails.length;
+			const segThumbStart = Math.floor(seg.startFrame / framesPerThumb);
+			const segThumbEnd = Math.ceil(seg.endFrame / framesPerThumb);
+			const segThumbs = thumbnails.slice(segThumbStart, Math.max(segThumbStart + 1, segThumbEnd));
+
+			for (let i = 0; i < segThumbs.length; i++) {
+				result.push({
+					src: segThumbs[i],
+					widthPercent: widthPercent / segThumbs.length
+				});
+			}
+		}
+		return result;
+	}
+
 	function handleMouseDown(point: 'start' | 'end') {
 		draggingTrimPoint = point;
 	}
@@ -487,19 +605,15 @@
 		// Add global event listeners for drag support
 		if (browser) {
 			const handleGlobalMouseMove = (e: MouseEvent) => {
-				if (draggingTrimPoint && isTrimMode) {
-					// Find the timeline slider and calculate position
-					const slider = document.querySelector('input[type="range"]') as HTMLInputElement;
-					if (slider) {
-						const rect = slider.getBoundingClientRect();
-						const percent = (e.clientX - rect.left) / rect.width;
-						const frame = Math.max(0, Math.min(totalFrames - 1, Math.round(percent * (totalFrames - 1))));
-						
-						if (draggingTrimPoint === 'start') {
-							trimStartFrame = frame;
-						} else if (draggingTrimPoint === 'end') {
-							trimEndFrame = frame;
-						}
+				if (draggingTrimPoint && isTrimMode && trackContainer) {
+					const rect = trackContainer.getBoundingClientRect();
+					const percent = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+					const frame = Math.round(percent * (totalFrames - 1));
+					
+					if (draggingTrimPoint === 'start') {
+						trimStartFrame = frame;
+					} else if (draggingTrimPoint === 'end') {
+						trimEndFrame = frame;
 					}
 				}
 			};
@@ -574,96 +688,177 @@
 		<span>{videoWidth}×{videoHeight} @ {frameRate.toFixed(2)}fps</span>
 	</div>
 
-	<!-- Timeline Scrubber -->
-	<div 
-		class={`w-full p-2 rounded-lg transition-colors ${isTrimMode ? 'bg-blue-950 border border-blue-600' : ''}`}
-		onmousemove={handleTimelineMouseMove}
-		onmouseleave={handleTimelineMouseLeave}
-	>
-		{#if isTrimMode}
-			<div class="flex items-center justify-between mb-2">
-				<div class="text-xs text-slate-400">
-					{#if trimStartFrame === null}
-						<span class="text-yellow-500">Click to set Start Point</span>
-					{:else if trimEndFrame === null}
-						<span class="text-yellow-500">Click to set End Point</span>
+	<!-- Trim Mode Controls -->
+	{#if isTrimMode}
+		<div class="flex items-center justify-between px-2">
+			<div class="text-xs text-slate-400">
+				{#if trimStartFrame === null}
+					<span class="text-yellow-500">Click track to set Start Point</span>
+				{:else if trimEndFrame === null}
+					<span class="text-yellow-500">Click track to set End Point</span>
+				{:else}
+					<span class="text-green-500">{formatTrimRangeDisplay()}</span>
+				{/if}
+			</div>
+			
+			{#if trimStartFrame !== null && trimEndFrame !== null}
+				<div class="flex items-center gap-2">
+					<button
+						onclick={toggleTrimDisplayMode}
+						class="px-2 py-1 bg-slate-700 border border-slate-600 rounded text-slate-300 text-xs hover:bg-slate-600 transition-colors"
+						title="Toggle between frames and seconds"
+					>
+						{trimDisplayMode === 'frames' ? '🎬 Frames' : '⏱ Seconds'}
+					</button>
+					
+					<button
+						onclick={executeTrim}
+						class="px-3 py-1 bg-green-600 border border-green-500 rounded text-white text-xs font-medium hover:bg-green-500 transition-colors"
+						title="Apply Trim"
+					>
+						✓ Apply Trim
+					</button>
+				</div>
+			{/if}
+		</div>
+	{/if}
+
+	<!-- Video Track (Filmstrip) -->
+	<div class="w-full">
+		<!-- Time ruler -->
+		<div class="relative h-5 mb-1 select-none flex items-center">
+			{#if totalFrames > 0}
+				{@const totalSec = totalFrames / frameRate}
+				{@const tickInterval = totalSec <= 10 ? 1 : totalSec <= 30 ? 2 : totalSec <= 60 ? 5 : 10}
+				{@const tickCount = Math.floor(totalSec / tickInterval)}
+				<div class="relative flex-1">
+					{#each Array(tickCount + 1) as _, i}
+						{@const sec = i * tickInterval}
+						{@const pct = (sec / totalSec) * 100}
+						<div class="absolute top-0 flex flex-col items-center" style={`left: ${pct}%;`}>
+							<div class="w-px h-2 bg-slate-600"></div>
+							<span class="text-[9px] text-slate-500 font-mono mt-0.5 -translate-x-1/2">{sec}s</span>
+						</div>
+					{/each}
+				</div>
+				<span class="text-[9px] text-slate-500 font-mono flex-shrink-0 ml-2">{totalSec.toFixed(1)}s</span>
+			{/if}
+		</div>
+
+		<!-- Track Row -->
+		<div class="flex items-center gap-2">
+			<!-- Filmstrip Track -->
+			<!-- svelte-ignore a11y_click_events_have_key_events -->
+			<div
+				bind:this={trackContainer}
+				class={`relative flex-1 h-14 rounded-md overflow-hidden cursor-pointer border-2 transition-colors select-none ${isTrimMode ? 'border-blue-500' : 'border-slate-600 hover:border-slate-500'}`}
+				onclick={handleTrackClick}
+				onmousemove={handleTrackMouseMove}
+				onmouseleave={handleTrackMouseLeave}
+				role="slider"
+				aria-valuenow={currentFrame}
+				aria-valuemin={0}
+				aria-valuemax={totalFrames - 1}
+				tabindex="0"
+			>
+				<!-- Thumbnail filmstrip background -->
+				<div class="absolute inset-0 flex">
+					{#if thumbnails.length > 0}
+						{#each getThumbnailsForSegments() as thumb}
+							<img
+								src={thumb.src}
+								alt=""
+								class="h-full object-cover flex-shrink-0"
+								style={`width: ${thumb.widthPercent}%;`}
+								draggable="false"
+							/>
+						{/each}
 					{:else}
-						<span class="text-green-500">{formatTrimRangeDisplay()}</span>
+						<div class="w-full h-full bg-slate-800 flex items-center justify-center">
+							<span class="text-slate-500 text-xs">Loading thumbnails...</span>
+						</div>
 					{/if}
 				</div>
-				
-				{#if trimStartFrame !== null && trimEndFrame !== null}
-					<div class="flex items-center gap-2">
-						<button
-							onclick={toggleTrimDisplayMode}
-							class="px-2 py-1 bg-slate-700 border border-slate-600 rounded text-slate-300 text-xs hover:bg-slate-600 transition-colors"
-							title="Toggle between frames and seconds"
-						>
-							{trimDisplayMode === 'frames' ? '🎬 Frames' : '⏱ Seconds'}
-						</button>
-						
-						<button
-							onclick={executeTrim}
-							class="px-3 py-1 bg-green-600 border border-green-500 rounded text-white text-xs font-medium hover:bg-green-500 transition-colors"
-							title="Apply Trim"
-						>
-							✓ Apply Trim
-						</button>
+
+				<!-- Darken overlay for contrast -->
+				<div class="absolute inset-0 bg-black/20 pointer-events-none"></div>
+
+				<!-- Trim range highlight -->
+				{#if isTrimMode && trimStartFrame !== null && trimEndFrame !== null}
+					<div
+						class="absolute top-0 h-full bg-yellow-500/30 border-l-2 border-r-2 border-yellow-500 pointer-events-none"
+						style={`left: ${(Math.min(trimStartFrame, trimEndFrame) / (totalFrames - 1)) * 100}%; right: ${100 - (Math.max(trimStartFrame, trimEndFrame) / (totalFrames - 1)) * 100}%; z-index: 3;`}
+					></div>
+				{/if}
+
+				<!-- Trim start handle -->
+				{#if isTrimMode && trimStartFrame !== null}
+					<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+					<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+					<div
+						class="absolute top-0 h-full w-1.5 bg-yellow-400 cursor-col-resize hover:bg-yellow-300 transition-colors"
+						style={`left: ${(trimStartFrame / (totalFrames - 1)) * 100}%; transform: translateX(-50%); z-index: 5;`}
+						onmousedown={() => handleMouseDown('start')}
+						role="separator"
+						aria-label="Trim start"
+						tabindex="0"
+					>
+						<div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-3 h-6 bg-yellow-400 rounded-sm border border-yellow-300 shadow-lg flex items-center justify-center">
+							<div class="w-0.5 h-3 bg-yellow-700 rounded-full"></div>
+						</div>
+					</div>
+				{/if}
+
+				<!-- Trim end handle -->
+				{#if isTrimMode && trimEndFrame !== null}
+					<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+					<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+					<div
+						class="absolute top-0 h-full w-1.5 bg-yellow-400 cursor-col-resize hover:bg-yellow-300 transition-colors"
+						style={`left: ${(trimEndFrame / (totalFrames - 1)) * 100}%; transform: translateX(-50%); z-index: 5;`}
+						onmousedown={() => handleMouseDown('end')}
+						role="separator"
+						aria-label="Trim end"
+						tabindex="0"
+					>
+						<div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-3 h-6 bg-yellow-400 rounded-sm border border-yellow-300 shadow-lg flex items-center justify-center">
+							<div class="w-0.5 h-3 bg-yellow-700 rounded-full"></div>
+						</div>
+					</div>
+				{/if}
+
+				<!-- Hover indicator -->
+				{#if trackHoverFrame !== null && !draggingTrimPoint}
+					<div
+						class="absolute top-0 h-full w-px bg-white/40 pointer-events-none"
+						style={`left: ${(trackHoverFrame / (totalFrames - 1)) * 100}%; z-index: 4;`}
+					></div>
+					<!-- Hover timecode tooltip -->
+					<div
+						class="absolute -top-6 pointer-events-none"
+						style={`left: ${(trackHoverFrame / (totalFrames - 1)) * 100}%; transform: translateX(-50%); z-index: 6;`}
+					>
+						<span class="bg-slate-800 border border-slate-600 text-[9px] font-mono text-slate-300 px-1.5 py-0.5 rounded whitespace-nowrap">
+							{formatTimecode(trackHoverFrame)}
+						</span>
+					</div>
+				{/if}
+
+				<!-- Playhead -->
+				{#if totalFrames > 0}
+					<div
+						class="absolute top-0 h-full pointer-events-none"
+						style={`left: ${(currentFrame / (totalFrames - 1)) * 100}%; z-index: 6;`}
+					>
+						<!-- Playhead line -->
+						<div class="absolute top-0 h-full w-0.5 bg-red-500 -translate-x-1/2"></div>
+						<!-- Playhead top marker -->
+						<div class="absolute -top-1.5 left-1/2 -translate-x-1/2 w-0 h-0"
+							style="border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 6px solid #ef4444;"
+						></div>
 					</div>
 				{/if}
 			</div>
-		{/if}
-		
-		<div class="relative">
-			{#if trimStartFrame !== null && trimEndFrame !== null}
-				<div
-					class="absolute top-0 h-full bg-yellow-500/30 border-l-2 border-r-2 border-yellow-500 rounded pointer-events-none"
-					style={`left: ${(Math.min(trimStartFrame, trimEndFrame) / (totalFrames - 1)) * 100}%; right: ${100 - (Math.max(trimStartFrame, trimEndFrame) / (totalFrames - 1)) * 100}%; z-index: 1;`}
-				></div>
-			{/if}
-			
-			{#if isTrimMode && hoverFrame !== null && trimStartFrame === null}
-				<div
-					class="absolute top-1/2 -translate-y-1/2 w-0.5 h-4 bg-yellow-400 pointer-events-none"
-					style={`left: ${(hoverFrame / (totalFrames - 1)) * 100}%; z-index: 3;`}
-				></div>
-			{/if}
-
-			{#if isTrimMode && hoverFrame !== null && trimStartFrame !== null && trimEndFrame === null}
-				<div
-					class="absolute top-1/2 -translate-y-1/2 w-0.5 h-4 bg-yellow-400 pointer-events-none"
-					style={`left: ${(hoverFrame / (totalFrames - 1)) * 100}%; z-index: 3;`}
-				></div>
-			{/if}
-
-			{#if trimStartFrame !== null}
-				<div
-					class="absolute top-1/2 -translate-y-1/2 w-1 h-6 bg-yellow-400 border border-yellow-300 rounded cursor-grab active:cursor-grabbing hover:bg-yellow-300"
-					style={`left: ${(trimStartFrame / (totalFrames - 1)) * 100}%; transform: translateY(-50%) translateX(-50%); z-index: 4;`}
-					onmousedown={() => handleMouseDown('start')}
-					title="Drag to adjust start point"
-				></div>
-			{/if}
-
-			{#if trimEndFrame !== null}
-				<div
-					class="absolute top-1/2 -translate-y-1/2 w-1 h-6 bg-yellow-400 border border-yellow-300 rounded cursor-grab active:cursor-grabbing hover:bg-yellow-300"
-					style={`left: ${(trimEndFrame / (totalFrames - 1)) * 100}%; transform: translateY(-50%) translateX(-50%); z-index: 4;`}
-					onmousedown={() => handleMouseDown('end')}
-					title="Drag to adjust end point"
-				></div>
-			{/if}
-			
-			<input
-				type="range"
-				min="0"
-				max={totalFrames - 1}
-				value={currentFrame}
-				oninput={handleSliderInput}
-				disabled={!isLoaded}
-				class="relative w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
-				style="z-index: 2;"
-			/>
 		</div>
 	</div>
 

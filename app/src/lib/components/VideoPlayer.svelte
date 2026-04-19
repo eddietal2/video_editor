@@ -605,7 +605,7 @@
 				codec: 'avc1.42001f',
 				width: videoWidth,
 				height: videoHeight,
-				bitrate: 8_000_000,
+				bitrate: 20_000_000,
 				framerate: frameRate,
 			});
 
@@ -635,7 +635,7 @@
 				const frame = new VideoFrame(canvas, {
 					timestamp: vf * frameDurationMicros,
 				});
-				encoder.encode(frame, { keyFrame: vf % 60 === 0 });
+				encoder.encode(frame, { keyFrame: vf % 30 === 0 });
 				frame.close();
 
 				exportProgress = Math.round(((vf + 1) / totalVirtFrames) * 100);

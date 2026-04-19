@@ -119,6 +119,22 @@
 		videoEl.crossOrigin = 'anonymous';
 		document.body.appendChild(videoEl);
 
+		// Create a second video element for double-buffered segment playback
+		const videoB = document.createElement('video');
+		videoB.muted = true;
+		videoB.playsInline = true;
+		videoB.preload = 'auto';
+		videoB.src = videoEl.src;
+		videoB.style.display = 'none';
+		videoB.crossOrigin = 'anonymous';
+		document.body.appendChild(videoB);
+
+		// Wait for videoB to be ready
+		await new Promise<void>((resolve) => {
+			videoB.onloadeddata = () => resolve();
+			if (videoB.readyState >= 2) resolve();
+		});
+
 		isLoaded = true;
 
 		// Draw the first frame
@@ -136,8 +152,9 @@
 			videoEl.addEventListener('seeked', onSeeked);
 		});
 
-		// Store video element for playback
+		// Store video elements for playback
 		(window as any).__videoEl = videoEl;
+		(window as any).__videoElB = videoB;
 		(window as any).__videoContainer = videoEl;
 
 		// Generate filmstrip thumbnails
@@ -239,60 +256,98 @@
 		return segments.reduce((sum, seg) => sum + (seg.endFrame - seg.startFrame + 1), 0);
 	}
 
+	// Find which segment index a real frame is inside
+	function getSegmentIndex(realFrame: number): number {
+		for (let i = 0; i < segments.length; i++) {
+			if (realFrame >= segments[i].startFrame && realFrame <= segments[i].endFrame) {
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	// Pre-seek the standby video to the next segment's start frame
+	function preSeekStandby(standbyEl: HTMLVideoElement, currentSegIdx: number) {
+		const nextIdx = currentSegIdx + 1;
+		if (nextIdx < segments.length) {
+			standbyEl.currentTime = segments[nextIdx].startFrame / frameRate;
+		}
+	}
+
 	function play() {
 		if (!isLoaded) return;
-		const videoEl = (window as any).__videoEl as HTMLVideoElement;
-		if (!videoEl) {
-			error = 'Video element not found';
+		const videoA = (window as any).__videoEl as HTMLVideoElement;
+		const videoB = (window as any).__videoElB as HTMLVideoElement;
+		if (!videoA || !videoB) {
+			error = 'Video elements not found';
 			return;
 		}
 
 		isPlaying = true;
-		videoEl.play().catch((err: any) => {
+
+		// Determine which segment we're currently in
+		const realFrame = virtualToRealFrame(currentFrame);
+		let currentSegIdx = getSegmentIndex(realFrame);
+		if (currentSegIdx < 0) currentSegIdx = 0;
+
+		// Set up active/standby
+		let activeEl = videoA;
+		let standbyEl = videoB;
+
+		// Ensure active is at correct position and playing
+		activeEl.currentTime = realFrame / frameRate;
+		activeEl.play().catch((err: any) => {
 			error = `Playback error: ${err.message}`;
 			isPlaying = false;
 		});
+
+		// Pre-seek standby to the next segment
+		preSeekStandby(standbyEl, currentSegIdx);
 
 		const renderLoop = () => {
 			if (!isPlaying) return;
 
 			try {
-				const realFrame = Math.floor(videoEl.currentTime * frameRate);
-				const { segIndex, isInSegment } = findSegmentForRealFrame(realFrame);
+				const activeRealFrame = Math.floor(activeEl.currentTime * frameRate);
 
-				if (!isInSegment) {
-					// We've entered a trimmed region — jump to next segment
-					if (segIndex >= 0 && segIndex < segments.length) {
-						videoEl.currentTime = segments[segIndex].startFrame / frameRate;
+				// Check if we've passed the end of the current segment
+				if (currentSegIdx >= 0 && currentSegIdx < segments.length &&
+					activeRealFrame > segments[currentSegIdx].endFrame) {
+
+					const nextIdx = currentSegIdx + 1;
+					if (nextIdx < segments.length) {
+						// Swap: standby becomes active (it's already seeked to the right spot)
+						activeEl.pause();
+						const temp = activeEl;
+						activeEl = standbyEl;
+						standbyEl = temp;
+
+						currentSegIdx = nextIdx;
+						activeEl.play().catch(() => {});
+
+						// Pre-seek the new standby to the NEXT segment
+						preSeekStandby(standbyEl, currentSegIdx);
 					} else {
-						// No more segments, we've reached the end
+						// No more segments
 						isPlaying = false;
-						videoEl.pause();
+						activeEl.pause();
 						return;
-					}
-				} else {
-					// Check if we've passed the end of the current segment
-					if (realFrame > segments[segIndex].endFrame) {
-						const nextSeg = segIndex + 1;
-						if (nextSeg < segments.length) {
-							videoEl.currentTime = segments[nextSeg].startFrame / frameRate;
-						} else {
-							isPlaying = false;
-							videoEl.pause();
-							return;
-						}
 					}
 				}
 
-				drawVideoFrame(videoEl);
-				const virtualFrame = realToVirtualFrame(Math.floor(videoEl.currentTime * frameRate));
-				if (virtualFrame >= 0) currentFrame = virtualFrame;
+				// Always draw from the active element
+				drawVideoFrame(activeEl);
+				const virtualFrame = realToVirtualFrame(Math.floor(activeEl.currentTime * frameRate));
+				if (virtualFrame >= 0) {
+					currentFrame = virtualFrame;
+				}
 			} catch (e) {
 				console.error('Render error:', e);
 			}
 
-			if (videoEl.ended || currentFrame >= totalFrames - 1) {
+			if (activeEl.ended || currentFrame >= totalFrames - 1) {
 				isPlaying = false;
+				activeEl.pause();
 				return;
 			}
 			animationId = requestAnimationFrame(renderLoop);
@@ -303,10 +358,10 @@
 	function pause() {
 		isPlaying = false;
 		if (browser) {
-			const videoEl = (window as any).__videoEl as HTMLVideoElement;
-			if (videoEl) {
-				videoEl.pause();
-			}
+			const videoA = (window as any).__videoEl as HTMLVideoElement;
+			const videoB = (window as any).__videoElB as HTMLVideoElement;
+			if (videoA) videoA.pause();
+			if (videoB) videoB.pause();
 		}
 		if (animationId !== null) {
 			cancelAnimationFrame(animationId);
@@ -496,6 +551,98 @@
 		trimDisplayMode = 'frames';
 	}
 
+	async function exportVideo() {
+		if (!browser || !isLoaded || !canvas) {
+			error = 'Cannot export: video not loaded';
+			return;
+		}
+
+		try {
+			error = '';
+			const videoEl = (window as any).__videoEl as HTMLVideoElement;
+			if (!videoEl) {
+				error = 'Video element not found';
+				return;
+			}
+
+			// Get canvas stream for encoding
+			const stream = canvas.captureStream(frameRate) as MediaStream;
+			const recorder = new MediaRecorder(stream, {
+				mimeType: 'video/mp4',
+				videoBitsPerSecond: 5000000 // 5 Mbps
+			});
+
+			const chunks: Blob[] = [];
+			recorder.ondataavailable = (e: BlobEvent) => {
+				if (e.data.size > 0) {
+					chunks.push(e.data);
+				}
+			};
+
+			recorder.onerror = (e: Event) => {
+				const errorEvent = e as Event & { error?: DOMException };
+				error = `Recording error: ${errorEvent.error?.message || 'Unknown error'}`;
+				console.error('MediaRecorder error:', errorEvent.error);
+			};
+
+			// Wait a bit for the stream to be ready
+			await new Promise(resolve => setTimeout(resolve, 100));
+
+			recorder.start();
+			const wasPlaying = isPlaying;
+			if (wasPlaying) {
+				pause();
+			}
+
+			// Render all kept frames
+			const framesToRender = getVirtualTotalFrames();
+			for (let i = 0; i < framesToRender; i++) {
+				const realFrame = virtualToRealFrame(i);
+				if (realFrame >= 0) {
+					videoEl.currentTime = realFrame / frameRate;
+					await new Promise(resolve => {
+						const onSeeked = () => {
+							drawVideoFrame(videoEl);
+							videoEl.removeEventListener('seeked', onSeeked);
+							// Give the renderer time to draw
+							requestAnimationFrame(() => resolve(null));
+						};
+						videoEl.addEventListener('seeked', onSeeked);
+					});
+				}
+			}
+
+			// Stop recording
+			recorder.stop();
+
+			// Wait for all chunks to be collected
+			await new Promise(resolve => {
+				recorder.onstop = () => resolve(null);
+			});
+
+			// Create blob and download
+			const blob = new Blob(chunks, { type: 'video/mp4' });
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement('a');
+			a.href = url;
+			a.download = `video_${Date.now()}.mp4`;
+			document.body.appendChild(a);
+			a.click();
+			document.body.removeChild(a);
+			URL.revokeObjectURL(url);
+
+			// Restore playback state
+			currentFrame = 0;
+			seek(0);
+			if (wasPlaying) {
+				play();
+			}
+		} catch (e: any) {
+			error = `Export failed: ${e.message}`;
+			console.error('Export error:', e);
+		}
+	}
+
 	function handleTimelineMouseMove(e: MouseEvent) {
 		if (!isTrimMode) return;
 		
@@ -653,6 +800,16 @@
 			delete (window as any).__videoContainer;
 		}
 
+		const videoElB = (window as any).__videoElB;
+		if (videoElB) {
+			videoElB.pause();
+			videoElB.src = '';
+			if (videoElB.parentNode) {
+				videoElB.parentNode.removeChild(videoElB);
+			}
+			delete (window as any).__videoElB;
+		}
+
 		if (blobUrl) {
 			URL.revokeObjectURL(blobUrl);
 			blobUrl = null;
@@ -722,6 +879,18 @@
 			{/if}
 		</div>
 	{/if}
+
+	<!-- Export Button (always visible) -->
+	<div class="flex justify-end px-2">
+		<button
+			onclick={exportVideo}
+			disabled={!isLoaded}
+			class="px-4 py-2 bg-blue-600 border border-blue-500 rounded-md text-white text-sm font-medium hover:bg-blue-500 transition-colors disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2"
+			title="Export video with current edits as MP4"
+		>
+			↓ Export MP4
+		</button>
+	</div>
 
 	<!-- Video Track (Filmstrip) -->
 	<div class="w-full">

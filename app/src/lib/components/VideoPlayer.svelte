@@ -283,38 +283,54 @@
 	</div>
 
 	<!-- Transport Controls -->
-	<div class="flex items-center justify-center gap-3">
-		<button
-			onclick={stepBackward}
-			disabled={!isLoaded}
-			class="px-3 py-2 bg-slate-800 border border-slate-600 rounded-md text-slate-300 text-sm hover:bg-slate-700 hover:text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-		>
-			◀◀
-		</button>
+	<div class="flex items-center justify-between w-full">
+		<div></div>
 
-		{#if isPlaying}
+		<div class="flex items-center gap-3">
 			<button
-				onclick={pause}
-				class="px-5 py-2 bg-blue-600 border border-blue-500 rounded-md text-white text-sm font-medium hover:bg-blue-500 transition-colors"
-			>
-				⏸ Pause
-			</button>
-		{:else}
-			<button
-				onclick={play}
+				onclick={stepBackward}
 				disabled={!isLoaded}
-				class="px-5 py-2 bg-blue-600 border border-blue-500 rounded-md text-white text-sm font-medium hover:bg-blue-500 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+				class="px-3 py-2 bg-slate-800 border border-slate-600 rounded-md text-slate-300 text-sm hover:bg-slate-700 hover:text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
 			>
-				▶ Play
+				◀◀
 			</button>
-		{/if}
 
-		<button
-			onclick={stepForward}
-			disabled={!isLoaded}
-			class="px-3 py-2 bg-slate-800 border border-slate-600 rounded-md text-slate-300 text-sm hover:bg-slate-700 hover:text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-		>
-			▶▶
-		</button>
+			{#if isPlaying}
+				<button
+					onclick={pause}
+					class="px-5 py-2 bg-blue-600 border border-blue-500 rounded-md text-white text-sm font-medium hover:bg-blue-500 transition-colors"
+				>
+					⏸ Pause
+				</button>
+			{:else}
+				<button
+					onclick={play}
+					disabled={!isLoaded}
+					class="px-5 py-2 bg-blue-600 border border-blue-500 rounded-md text-white text-sm font-medium hover:bg-blue-500 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+				>
+					▶ Play
+				</button>
+			{/if}
+
+			<button
+				onclick={stepForward}
+				disabled={!isLoaded}
+				class="px-3 py-2 bg-slate-800 border border-slate-600 rounded-md text-slate-300 text-sm hover:bg-slate-700 hover:text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+			>
+				▶▶
+			</button>
+		</div>
+
+		<div class="flex items-center gap-3">
+			<div class="w-px h-6 bg-slate-700"></div>
+
+			<button
+				disabled={!isLoaded}
+				class="px-3 py-2 bg-slate-800 border border-slate-600 rounded-md text-slate-300 text-sm hover:bg-slate-700 hover:text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+				title="Trim"
+			>
+				✂
+			</button>
+		</div>
 	</div>
 </div>

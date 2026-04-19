@@ -34,6 +34,12 @@
 	let trimDisplayMode = $state<'frames' | 'seconds'>('frames');
 	let showTrimConfirmModal = $state(false);
 	let pendingTrimData = $state<{start: number, end: number, duration: string} | null>(null);
+	let isTrimmingVideo = $state(false);
+	let trimProgress = $state(0);
+
+	// Segment-based editing: track which portions of the original video are kept
+	let segments = $state<{startFrame: number, endFrame: number}[]>([]);
+	let originalTotalFrames = 0;
 
 	function initDecoder() {
 		decoder = new VideoDecoder({
@@ -82,7 +88,9 @@
 				videoWidth = videoEl.videoWidth;
 				videoHeight = videoEl.videoHeight;
 				frameRate = 29.97; // Default NTSC
-				totalFrames = Math.floor(videoEl.duration * frameRate);
+				originalTotalFrames = Math.floor(videoEl.duration * frameRate);
+				totalFrames = originalTotalFrames;
+				segments = [{ startFrame: 0, endFrame: originalTotalFrames - 1 }];
 
 				if (canvas) {
 					canvas.width = videoWidth;
@@ -136,6 +144,51 @@
 		}
 	}
 
+	// Convert a virtual (timeline) frame to the real frame in the original video
+	function virtualToRealFrame(virtualFrame: number): number {
+		let accumulated = 0;
+		for (const seg of segments) {
+			const segLen = seg.endFrame - seg.startFrame + 1;
+			if (virtualFrame < accumulated + segLen) {
+				return seg.startFrame + (virtualFrame - accumulated);
+			}
+			accumulated += segLen;
+		}
+		return segments[segments.length - 1].endFrame;
+	}
+
+	// Convert a real frame to virtual (timeline) frame, or -1 if not in any segment
+	function realToVirtualFrame(realFrame: number): number {
+		let accumulated = 0;
+		for (const seg of segments) {
+			if (realFrame >= seg.startFrame && realFrame <= seg.endFrame) {
+				return accumulated + (realFrame - seg.startFrame);
+			}
+			accumulated += seg.endFrame - seg.startFrame + 1;
+		}
+		return -1;
+	}
+
+	// Find which segment a real frame belongs to, and the next segment
+	function findSegmentForRealFrame(realFrame: number): { segIndex: number, isInSegment: boolean } {
+		for (let i = 0; i < segments.length; i++) {
+			if (realFrame >= segments[i].startFrame && realFrame <= segments[i].endFrame) {
+				return { segIndex: i, isInSegment: true };
+			}
+		}
+		// Find the next segment after this real frame
+		for (let i = 0; i < segments.length; i++) {
+			if (segments[i].startFrame > realFrame) {
+				return { segIndex: i, isInSegment: false };
+			}
+		}
+		return { segIndex: -1, isInSegment: false };
+	}
+
+	function getVirtualTotalFrames(): number {
+		return segments.reduce((sum, seg) => sum + (seg.endFrame - seg.startFrame + 1), 0);
+	}
+
 	function play() {
 		if (!isLoaded) return;
 		const videoEl = (window as any).__videoEl as HTMLVideoElement;
@@ -154,13 +207,41 @@
 			if (!isPlaying) return;
 
 			try {
+				const realFrame = Math.floor(videoEl.currentTime * frameRate);
+				const { segIndex, isInSegment } = findSegmentForRealFrame(realFrame);
+
+				if (!isInSegment) {
+					// We've entered a trimmed region — jump to next segment
+					if (segIndex >= 0 && segIndex < segments.length) {
+						videoEl.currentTime = segments[segIndex].startFrame / frameRate;
+					} else {
+						// No more segments, we've reached the end
+						isPlaying = false;
+						videoEl.pause();
+						return;
+					}
+				} else {
+					// Check if we've passed the end of the current segment
+					if (realFrame > segments[segIndex].endFrame) {
+						const nextSeg = segIndex + 1;
+						if (nextSeg < segments.length) {
+							videoEl.currentTime = segments[nextSeg].startFrame / frameRate;
+						} else {
+							isPlaying = false;
+							videoEl.pause();
+							return;
+						}
+					}
+				}
+
 				drawVideoFrame(videoEl);
-				currentFrame = Math.floor(videoEl.currentTime * frameRate);
+				const virtualFrame = realToVirtualFrame(Math.floor(videoEl.currentTime * frameRate));
+				if (virtualFrame >= 0) currentFrame = virtualFrame;
 			} catch (e) {
 				console.error('Render error:', e);
 			}
 
-			if (videoEl.ended) {
+			if (videoEl.ended || currentFrame >= totalFrames - 1) {
 				isPlaying = false;
 				return;
 			}
@@ -192,8 +273,10 @@
 			videoEl.pause();
 		}
 
+		// Map virtual frame to real frame in the original video
+		const realFrame = virtualToRealFrame(frameNumber);
 		currentFrame = frameNumber;
-		videoEl.currentTime = frameNumber / frameRate;
+		videoEl.currentTime = realFrame / frameRate;
 
 		const onSeeked = () => {
 			drawVideoFrame(videoEl);
@@ -281,24 +364,68 @@
 	}
 
 	function confirmTrim() {
-		if (!pendingTrimData) return;
-		
-		const { start, end, duration } = pendingTrimData;
-		
-		// Log the trim action
-		console.log(`Trim executed: Frame ${start} to ${end}`);
-		console.log(`Duration: ${duration}s`);
-		
-		// TODO: Implement actual trim logic here
-		// This could involve:
-		// - Creating a new video file with only the trimmed segment
-		// - Updating the video source
-		// - Exporting the trimmed video
-		
-		// Close modal and reset
+		if (!pendingTrimData || !browser) return;
+		processTrim(pendingTrimData.start, pendingTrimData.end);
+	}
+
+	function processTrim(trimStart: number, trimEnd: number) {
+		if (!browser) return;
+
+		const videoEl = (window as any).__videoEl as HTMLVideoElement;
+		if (!videoEl) return;
+
+		// Convert virtual trim range to real frames
+		const realStart = virtualToRealFrame(trimStart);
+		const realEnd = virtualToRealFrame(trimEnd);
+
+		// Remove the trimmed range from the segment list
+		const newSegments: {startFrame: number, endFrame: number}[] = [];
+
+		for (const seg of segments) {
+			// Segment is entirely before the trim — keep it
+			if (seg.endFrame < realStart) {
+				newSegments.push({ ...seg });
+				continue;
+			}
+
+			// Segment is entirely after the trim — keep it
+			if (seg.startFrame > realEnd) {
+				newSegments.push({ ...seg });
+				continue;
+			}
+
+			// Segment overlaps with trim — split it
+			// Part before the trim
+			if (seg.startFrame < realStart) {
+				newSegments.push({ startFrame: seg.startFrame, endFrame: realStart - 1 });
+			}
+
+			// Part after the trim
+			if (seg.endFrame > realEnd) {
+				newSegments.push({ startFrame: realEnd + 1, endFrame: seg.endFrame });
+			}
+		}
+
+		segments = newSegments;
+		totalFrames = getVirtualTotalFrames();
+
+		// Clamp current frame
+		if (currentFrame >= totalFrames) {
+			currentFrame = Math.max(0, totalFrames - 1);
+		}
+
+		// Reset trim state
 		showTrimConfirmModal = false;
 		pendingTrimData = null;
-		error = '';
+		trimStartFrame = null;
+		trimEndFrame = null;
+		hoverFrame = null;
+		draggingTrimPoint = null;
+		trimDisplayMode = 'frames';
+		isTrimMode = false;
+
+		// Seek to current position (now remapped)
+		seek(Math.min(currentFrame, totalFrames - 1));
 	}
 
 	function dismissTrimModal() {
@@ -610,45 +737,65 @@
 		<div class="bg-slate-900 border border-slate-700 rounded-lg shadow-2xl max-w-sm mx-4">
 			<!-- Header -->
 			<div class="border-b border-slate-700 px-6 py-4">
-				<h2 class="text-lg font-bold text-white">Confirm Trim</h2>
+				<h2 class="text-lg font-bold text-white">
+					{isTrimmingVideo ? 'Processing Trim...' : 'Confirm Trim'}
+				</h2>
 			</div>
 			
 			<!-- Content -->
 			<div class="px-6 py-6 space-y-4">
-				<div class="bg-slate-800/50 rounded-lg p-4 space-y-3">
-					<div class="flex justify-between items-center">
-						<span class="text-slate-400 text-sm">Start Frame:</span>
-						<span class="text-white font-mono text-sm">{pendingTrimData.start}</span>
+				{#if isTrimmingVideo}
+					<!-- Loading Spinner -->
+					<div class="flex flex-col items-center justify-center py-8 space-y-4">
+						<div class="w-12 h-12 border-4 border-slate-700 border-t-blue-500 rounded-full animate-spin"></div>
+						<div class="text-center space-y-2">
+							<p class="text-sm text-slate-300 font-medium">Trimming video segment...</p>
+							<p class="text-xs text-slate-500">{trimProgress}% Complete</p>
+						</div>
 					</div>
-					<div class="flex justify-between items-center">
-						<span class="text-slate-400 text-sm">End Frame:</span>
-						<span class="text-white font-mono text-sm">{pendingTrimData.end}</span>
+				{:else}
+					<!-- Trim Details -->
+					<div class="bg-slate-800/50 rounded-lg p-4 space-y-3">
+						<div class="flex justify-between items-center">
+							<span class="text-slate-400 text-sm">Start Frame:</span>
+							<span class="text-white font-mono text-sm">{pendingTrimData.start}</span>
+						</div>
+						<div class="flex justify-between items-center">
+							<span class="text-slate-400 text-sm">End Frame:</span>
+							<span class="text-white font-mono text-sm">{pendingTrimData.end}</span>
+						</div>
+						<div class="border-t border-slate-700 pt-3 flex justify-between items-center">
+							<span class="text-slate-300 text-sm font-medium">Frames to Remove:</span>
+							<span class="text-red-400 font-mono text-sm font-bold">{pendingTrimData.end - pendingTrimData.start + 1}</span>
+						</div>
+						<div class="flex justify-between items-center">
+							<span class="text-slate-300 text-sm font-medium">Duration:</span>
+							<span class="text-green-400 font-mono text-sm font-bold">{pendingTrimData.duration}s</span>
+						</div>
 					</div>
-					<div class="border-t border-slate-700 pt-3 flex justify-between items-center">
-						<span class="text-slate-300 text-sm font-medium">Duration:</span>
-						<span class="text-green-400 font-mono text-sm font-bold">{pendingTrimData.duration}s</span>
-					</div>
-				</div>
-				
-				<p class="text-slate-400 text-xs">This action will process the trimmed video segment.</p>
+					
+					<p class="text-slate-400 text-xs">This will permanently remove the selected frames from the video.</p>
+				{/if}
 			</div>
 			
 			<!-- Footer -->
-			<div class="border-t border-slate-700 px-6 py-4 flex items-center gap-3 justify-end">
-				<button
-					onclick={dismissTrimModal}
-					class="px-4 py-2 bg-slate-800 border border-slate-600 rounded-md text-slate-300 text-sm hover:bg-slate-700 transition-colors"
-				>
-					Cancel
-				</button>
-				
-				<button
-					onclick={confirmTrim}
-					class="px-4 py-2 bg-green-600 border border-green-500 rounded-md text-white text-sm font-medium hover:bg-green-500 transition-colors"
-				>
-					Apply Trim
-				</button>
-			</div>
+			{#if !isTrimmingVideo}
+				<div class="border-t border-slate-700 px-6 py-4 flex items-center gap-3 justify-end">
+					<button
+						onclick={dismissTrimModal}
+						class="px-4 py-2 bg-slate-800 border border-slate-600 rounded-md text-slate-300 text-sm hover:bg-slate-700 transition-colors"
+					>
+						Cancel
+					</button>
+					
+					<button
+						onclick={confirmTrim}
+						class="px-4 py-2 bg-red-600 border border-red-500 rounded-md text-white text-sm font-medium hover:bg-red-500 transition-colors"
+					>
+						Delete Frames
+					</button>
+				</div>
+			{/if}
 		</div>
 	</div>
 {/if}

@@ -26,6 +26,12 @@
 	let startTime = 0;
 	let decoderConfig: VideoDecoderConfig | null = null;
 	let blobUrl: string | null = null;
+	let isTrimMode = $state(false);
+	let trimStartFrame = $state<number | null>(null);
+	let trimEndFrame = $state<number | null>(null);
+	let hoverFrame = $state<number | null>(null);
+	let draggingTrimPoint = $state<'start' | 'end' | null>(null);
+	let trimDisplayMode = $state<'frames' | 'seconds'>('frames');
 
 	function initDecoder() {
 		decoder = new VideoDecoder({
@@ -201,7 +207,18 @@
 
 	function handleSliderInput(e: Event) {
 		const target = e.target as HTMLInputElement;
-		seek(parseInt(target.value));
+		const frame = parseInt(target.value);
+		
+		if (isTrimMode) {
+			// In trim mode, set start or end point
+			if (trimStartFrame === null) {
+				trimStartFrame = frame;
+			} else if (trimEndFrame === null) {
+				trimEndFrame = frame;
+			}
+		}
+		
+		seek(frame);
 	}
 
 	function stepForward() {
@@ -225,12 +242,105 @@
 		return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}:${String(remainingFrames).padStart(2, '0')}`;
 	}
 
+	function formatTrimRangeDisplay(): string {
+		if (trimStartFrame === null || trimEndFrame === null) return '';
+
+		const start = Math.min(trimStartFrame, trimEndFrame);
+		const end = Math.max(trimStartFrame, trimEndFrame);
+
+		if (trimDisplayMode === 'frames') {
+			return `Frame ${start} → ${end} (${end - start + 1} frames)`;
+		} else {
+			const startSeconds = (start / frameRate).toFixed(2);
+			const endSeconds = (end / frameRate).toFixed(2);
+			const durationSeconds = ((end - start + 1) / frameRate).toFixed(2);
+			return `${startSeconds}s → ${endSeconds}s (${durationSeconds}s duration)`;
+		}
+	}
+
+	function toggleTrimDisplayMode() {
+		trimDisplayMode = trimDisplayMode === 'frames' ? 'seconds' : 'frames';
+	}
+
+	function toggleTrimMode() {
+		isTrimMode = !isTrimMode;
+	}
+
+	function cancelTrimMode() {
+		isTrimMode = false;
+		trimStartFrame = null;
+		trimEndFrame = null;
+		hoverFrame = null;
+		draggingTrimPoint = null;
+		trimDisplayMode = 'frames';
+	}
+
+	function handleTimelineMouseMove(e: MouseEvent) {
+		if (!isTrimMode) return;
+		
+		const slider = e.currentTarget as HTMLInputElement;
+		const rect = slider.getBoundingClientRect();
+		const percent = (e.clientX - rect.left) / rect.width;
+		const frame = Math.max(0, Math.min(totalFrames - 1, Math.round(percent * (totalFrames - 1))));
+		
+		if (draggingTrimPoint === 'start') {
+			trimStartFrame = frame;
+		} else if (draggingTrimPoint === 'end') {
+			trimEndFrame = frame;
+		} else {
+			hoverFrame = frame;
+		}
+	}
+
+	function handleTimelineMouseLeave() {
+		if (!draggingTrimPoint) {
+			hoverFrame = null;
+		}
+	}
+
+	function handleMouseDown(point: 'start' | 'end') {
+		draggingTrimPoint = point;
+	}
+
+	function handleMouseUp() {
+		draggingTrimPoint = null;
+	}
+
 	onMount(() => {
 		if (!('VideoDecoder' in window)) {
 			error = 'WebCodecs API is not supported in this browser.';
 			return;
 		}
 		loadVideo();
+
+		// Add global event listeners for drag support
+		if (browser) {
+			const handleGlobalMouseMove = (e: MouseEvent) => {
+				if (draggingTrimPoint && isTrimMode) {
+					// Find the timeline slider and calculate position
+					const slider = document.querySelector('input[type="range"]') as HTMLInputElement;
+					if (slider) {
+						const rect = slider.getBoundingClientRect();
+						const percent = (e.clientX - rect.left) / rect.width;
+						const frame = Math.max(0, Math.min(totalFrames - 1, Math.round(percent * (totalFrames - 1))));
+						
+						if (draggingTrimPoint === 'start') {
+							trimStartFrame = frame;
+						} else if (draggingTrimPoint === 'end') {
+							trimEndFrame = frame;
+						}
+					}
+				}
+			};
+
+			document.addEventListener('mousemove', handleGlobalMouseMove);
+			document.addEventListener('mouseup', handleMouseUp);
+
+			return () => {
+				document.removeEventListener('mousemove', handleGlobalMouseMove);
+				document.removeEventListener('mouseup', handleMouseUp);
+			};
+		}
 	});
 
 	onDestroy(() => {
@@ -294,16 +404,86 @@
 	</div>
 
 	<!-- Timeline Scrubber -->
-	<div class="w-full">
-		<input
-			type="range"
-			min="0"
-			max={totalFrames - 1}
-			value={currentFrame}
-			oninput={handleSliderInput}
-			disabled={!isLoaded}
-			class="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
-		/>
+	<div 
+		class={`w-full p-2 rounded-lg transition-colors ${isTrimMode ? 'bg-blue-950 border border-blue-600' : ''}`}
+		onmousemove={handleTimelineMouseMove}
+		onmouseleave={handleTimelineMouseLeave}
+	>
+		{#if isTrimMode}
+			<div class="flex items-center justify-between mb-2">
+				<div class="text-xs text-slate-400">
+					{#if trimStartFrame === null}
+						<span class="text-yellow-500">Click to set Start Point</span>
+					{:else if trimEndFrame === null}
+						<span class="text-yellow-500">Click to set End Point</span>
+					{:else}
+						<span class="text-green-500">{formatTrimRangeDisplay()}</span>
+					{/if}
+				</div>
+				
+				{#if trimStartFrame !== null && trimEndFrame !== null}
+					<button
+						onclick={toggleTrimDisplayMode}
+						class="px-2 py-1 bg-slate-700 border border-slate-600 rounded text-slate-300 text-xs hover:bg-slate-600 transition-colors"
+						title="Toggle between frames and seconds"
+					>
+						{trimDisplayMode === 'frames' ? '🎬 Frames' : '⏱ Seconds'}
+					</button>
+				{/if}
+			</div>
+		{/if}
+		
+		<div class="relative">
+			{#if trimStartFrame !== null && trimEndFrame !== null}
+				<div
+					class="absolute top-0 h-full bg-yellow-500/30 border-l-2 border-r-2 border-yellow-500 rounded pointer-events-none"
+					style={`left: ${(Math.min(trimStartFrame, trimEndFrame) / (totalFrames - 1)) * 100}%; right: ${100 - (Math.max(trimStartFrame, trimEndFrame) / (totalFrames - 1)) * 100}%; z-index: 1;`}
+				></div>
+			{/if}
+			
+			{#if isTrimMode && hoverFrame !== null && trimStartFrame === null}
+				<div
+					class="absolute top-1/2 -translate-y-1/2 w-0.5 h-4 bg-yellow-400 pointer-events-none"
+					style={`left: ${(hoverFrame / (totalFrames - 1)) * 100}%; z-index: 3;`}
+				></div>
+			{/if}
+
+			{#if isTrimMode && hoverFrame !== null && trimStartFrame !== null && trimEndFrame === null}
+				<div
+					class="absolute top-1/2 -translate-y-1/2 w-0.5 h-4 bg-yellow-400 pointer-events-none"
+					style={`left: ${(hoverFrame / (totalFrames - 1)) * 100}%; z-index: 3;`}
+				></div>
+			{/if}
+
+			{#if trimStartFrame !== null}
+				<div
+					class="absolute top-1/2 -translate-y-1/2 w-1 h-6 bg-yellow-400 border border-yellow-300 rounded cursor-grab active:cursor-grabbing hover:bg-yellow-300"
+					style={`left: ${(trimStartFrame / (totalFrames - 1)) * 100}%; transform: translateY(-50%) translateX(-50%); z-index: 4;`}
+					onmousedown={() => handleMouseDown('start')}
+					title="Drag to adjust start point"
+				></div>
+			{/if}
+
+			{#if trimEndFrame !== null}
+				<div
+					class="absolute top-1/2 -translate-y-1/2 w-1 h-6 bg-yellow-400 border border-yellow-300 rounded cursor-grab active:cursor-grabbing hover:bg-yellow-300"
+					style={`left: ${(trimEndFrame / (totalFrames - 1)) * 100}%; transform: translateY(-50%) translateX(-50%); z-index: 4;`}
+					onmousedown={() => handleMouseDown('end')}
+					title="Drag to adjust end point"
+				></div>
+			{/if}
+			
+			<input
+				type="range"
+				min="0"
+				max={totalFrames - 1}
+				value={currentFrame}
+				oninput={handleSliderInput}
+				disabled={!isLoaded}
+				class="relative w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+				style="z-index: 2;"
+			/>
+		</div>
 	</div>
 
 	<!-- Transport Controls -->
@@ -350,11 +530,22 @@
 
 			<button
 				disabled={!isLoaded}
-				class="px-3 py-2 bg-slate-800 border border-slate-600 rounded-md text-slate-300 text-sm hover:bg-slate-700 hover:text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-				title="Trim"
+				onclick={toggleTrimMode}
+				class={`px-3 py-2 border rounded-md text-sm font-medium transition-colors ${isTrimMode ? 'bg-blue-600 border-blue-500 text-white hover:bg-blue-500' : 'bg-slate-800 border-slate-600 text-slate-300 hover:bg-slate-700 hover:text-white'} disabled:opacity-40 disabled:cursor-not-allowed`}
+				title="Trim Mode"
 			>
-				✂
+				✂ Trim Mode
 			</button>
+
+			{#if isTrimMode}
+				<button
+					onclick={cancelTrimMode}
+					class="px-3 py-2 bg-slate-800 border border-slate-600 rounded-md text-slate-300 text-sm hover:bg-slate-700 hover:text-white transition-colors"
+					title="Cancel Trim"
+				>
+					✕
+				</button>
+			{/if}
 		</div>
 	</div>
 </div>

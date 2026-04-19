@@ -206,6 +206,12 @@
 	function drawVideoFrame(source: HTMLVideoElement | VideoFrame) {
 		if (!ctx || !canvas) return;
 		try {
+			// Apply greyscale filter if enabled
+			if (enableGreyscale) {
+				ctx.filter = 'grayscale(1)';
+			} else {
+				ctx.filter = 'none';
+			}
 			ctx.drawImage(source as any, 0, 0, canvas.width, canvas.height);
 		} catch (e) {
 			console.error('Failed to draw frame:', e);
@@ -555,6 +561,7 @@
 	let isExporting = $state(false);
 	let exportProgress = $state(0);
 	let exportFps60 = $state(false);
+	let enableGreyscale = $state(false);
 
 	async function exportVideo(targetFps: number = frameRate) {
 		if (!browser || !isLoaded || !canvas) {
@@ -1032,6 +1039,14 @@
 			title="Toggle 60 FPS export"
 		>
 			{exportFps60 ? '60 FPS' : '30 FPS'}
+		</button>
+		<button
+			onclick={() => { enableGreyscale = !enableGreyscale; }}
+			disabled={isExporting}
+			class="px-3 py-2 {enableGreyscale ? 'bg-gray-600 border-gray-500' : 'bg-slate-700 border-slate-600'} border rounded-md text-white text-sm font-medium hover:opacity-80 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
+			title="Toggle greyscale filter"
+		>
+			{enableGreyscale ? '⊗ Greyscale' : '◯ Greyscale'}
 		</button>
 	</div>
 
